@@ -3,12 +3,10 @@ import selectors
 import json
 import io
 import struct
-
-request_search = {
-    "morpheus": "Follow the white rabbit. \U0001f430",
-    "ring": "In the caves beneath the Misty Mountains. \U0001f48d",
-    "\U0001f436": "\U0001f43e Playing ball! \U0001f3d0",
-}
+from Crypto.Cipher import AES, PKCS1_OAEP
+from Crypto import Random
+from Crypto.PublicKey import RSA
+from Crypto.Util import Padding
 
 
 class Message:
@@ -18,8 +16,18 @@ class Message:
         self.addr = addr
         self._recv_buffer = b""
         self._send_buffer = b""
-        self._jsonheader_len = None
-        self.jsonheader = None
+        self.header_len = None
+        self.header = None
+
+        self.key = None
+
+        self._header_len = 16   # header: 16 bytes
+        self._authtag_len = 12  # we'd like to use a 12-byte long authentication tag
+        self._sqn = 0
+        self._rcvsqn = 0
+        self.header = None
+        self._type = b''
+
         self.request = None
         self.response_created = False
 
@@ -50,7 +58,6 @@ class Message:
 
     def _write(self):
         if self._send_buffer:
-            print(f"Sending {self._send_buffer!r} to {self.addr}")
             try:
                 # Should be ready to write
                 sent = self.sock.send(self._send_buffer)
@@ -63,55 +70,40 @@ class Message:
                 if sent and not self._send_buffer:
                     self.close()
 
-    def _json_encode(self, obj, encoding):
-        return json.dumps(obj, ensure_ascii=False).encode(encoding)
-
-    def _json_decode(self, json_bytes, encoding):
-        tiow = io.TextIOWrapper(
-            io.BytesIO(json_bytes), encoding=encoding, newline=""
-        )
-        obj = json.load(tiow)
-        tiow.close()
-        return obj
-
     def _create_message(
-        self, *, content_bytes, content_type, content_encoding
+        self, *, payload
     ):
-        jsonheader = {
-            "byteorder": sys.byteorder,
-            "content-type": content_type,
-            "content-encoding": content_encoding,
-            "content-length": len(content_bytes),
-        }
-        jsonheader_bytes = self._json_encode(jsonheader, "utf-8")
-        message_hdr = struct.pack(">H", len(jsonheader_bytes))
-        message = message_hdr + jsonheader_bytes + content_bytes
-        return message
+        
+        # compute payload_length and set authtag_length
+        payload_length = len(payload)
+    
+        # compute message length...
+        # header: 16 bytes
+        # payload: payload_length
+        # authtag: authtag_length
+        msg_length = self._header_len + payload_length + self._authtag_len
 
-    def _create_response_json_content(self):
-        action = self.request.get("action")
-        if action == "search":
-            query = self.request.get("value")
-            answer = request_search.get(query) or f"No match for '{query}'."
-            content = {"result": answer}
-        else:
-            content = {"result": f"Error: invalid action '{action}'."}
-        content_encoding = "utf-8"
-        response = {
-            "content_bytes": self._json_encode(content, content_encoding),
-            "content_type": "text/json",
-            "content_encoding": content_encoding,
-        }
-        return response
+        # create header
+        ver = b'\x01\x00'                                     # protocol version 1.0
+        typ = b'\x00\x10'                                     # message type 1
+        len = msg_length.to_bytes(2, byteorder='big')         # message length (encoded on 2 bytes)
+        sqn = (1).to_bytes(2, byteorder='big')                # next message sequence number (encoded on 2 bytes)
+        rnd = Random.get_random_bytes(6)                      # 6-byte long random value
+        rsv = b'\x00\x00'                                     # reserved bytes
 
-    def _create_response_binary_content(self):
-        response = {
-            "content_bytes": b"First 10 bytes of request: "
-            + self.request[:10],
-            "content_type": "binary/custom-server-binary-type",
-            "content_encoding": "binary",
-        }
-        return response
+        header = ver + typ + len + sqn + rnd + rsv
+
+        # encrypt the payload and compute the authentication tag over the header and the payload
+        # with AES in GCM mode using nonce = sqn + rnd
+        nonce = sqn + rnd
+
+        AE = AES.new(self.key, AES.MODE_GCM, nonce=nonce, mac_len=self._authtag_len)
+        AE.update(header)
+        encrypted_payload, authtag = AE.encrypt_and_digest(payload)
+
+        msg = header + encrypted_payload + authtag
+        
+        return msg
 
     def process_events(self, mask):
         if mask & selectors.EVENT_READ:
@@ -121,17 +113,8 @@ class Message:
 
     def read(self):
         self._read()
-
-        if self._jsonheader_len is None:
-            self.process_protoheader()
-
-        if self._jsonheader_len is not None:
-            if self.jsonheader is None:
-                self.process_jsonheader()
-
-        if self.jsonheader:
-            if self.request is None:
-                self.process_request()
+        
+        self.process_request()
 
     def write(self):
         if self.request:
@@ -158,56 +141,74 @@ class Message:
             # Delete reference to socket object for garbage collection
             self.sock = None
 
-    def process_protoheader(self):
-        hdrlen = 2
-        if len(self._recv_buffer) >= hdrlen:
-            self._jsonheader_len = struct.unpack(
-                ">H", self._recv_buffer[:hdrlen]
-            )[0]
-            self._recv_buffer = self._recv_buffer[hdrlen:]
-
-    def process_jsonheader(self):
-        hdrlen = self._jsonheader_len
-        if len(self._recv_buffer) >= hdrlen:
-            self.jsonheader = self._json_decode(
-                self._recv_buffer[:hdrlen], "utf-8"
-            )
-            self._recv_buffer = self._recv_buffer[hdrlen:]
-            for reqhdr in (
-                "byteorder",
-                "content-length",
-                "content-type",
-                "content-encoding",
-            ):
-                if reqhdr not in self.jsonheader:
-                    raise ValueError(f"Missing required header '{reqhdr}'.")
-
     def process_request(self):
-        content_len = self.jsonheader["content-length"]
-        if not len(self._recv_buffer) >= content_len:
-            return
-        data = self._recv_buffer[:content_len]
-        self._recv_buffer = self._recv_buffer[content_len:]
-        if self.jsonheader["content-type"] == "text/json":
-            encoding = self.jsonheader["content-encoding"]
-            self.request = self._json_decode(data, encoding)
-            print(f"Received request {self.request!r} from {self.addr}")
+        msg = self._recv_buffer
+        # parse the message msg
+        
+        header = msg[0:16]
+        ver = header[0:2]      # version is encoded on 2 bytes 
+        typ = header[2:4]         # type is encoded on 2 byte 
+        len = header[4:6]       # msg length is encoded on 2 bytes 
+        sqn = header[6:8]          # msg sqn is encoded on 2 bytes 
+        rnd = header[8:14]         # random is encoded on 6 bytes 
+        rsv = header[14:16]        # reserved is encoded on 2 bytes
+
+        # check the msg length
+        msg_len = len(msg)
+        if msg_len != int.from_bytes(len, byteorder='big'):
+            print("Warning: Message length value in header is wrong!")
+            self.close()
+
+        # check the sequence number
+        print("Expecting sequence number " + str(self._rcvsqn + 1) + " or larger...")
+        sndsqn = int.from_bytes(sqn, byteorder='big')
+        if (sndsqn <= self._rcvsqn):
+            print("Error: Message sequence number is too old!")
+            print("Processing completed.")
+            self.close()    
+        print("Sequence number verification is successful.")
+
+        if typ == b'\x00\x00':
+
+            mtp_msg = msg[:-256]
+            etk = msg[-256:]                # header is 16 bytes long
+            authtag = mtp_msg[-12:]               # last 12 bytes is the authtag
+            encrypted_payload = mtp_msg[16:-12]   # encrypted payload is between header and authtag
+            
+            # create an RSA cipher object
+            RSAcipher = PKCS1_OAEP.new(...)
+            self.key = RSAcipher.decrypt(etk)
+
         else:
-            # Binary or unknown content-type
-            self.request = data
-            print(
-                f"Received {self.jsonheader['content-type']} "
-                f"request from {self.addr}"
-            )
+            authtag = msg[-12:]
+            encrypted_payload = msg[16:-12]
+
+        # verify and decrypt the encrypted payload
+        print("Decryption and authentication tag verification is attempted...")
+        nonce = sqn + rnd
+        AE = AES.new(self.key, AES.MODE_GCM, nonce=nonce, mac_len=12)
+        AE.update(header)
+        try:
+            payload = AE.decrypt_and_verify(encrypted_payload, authtag)
+        except Exception as e:
+            print("Error: Operation failed!")
+            print("Processing completed.")
+            sys.exit(1)
+        print("Operation was successful: message is intact, content is decrypted.")
+
+        self._rcvsqn += 1
+        
+        # TODO: login protocol
+
+        print(payload)
+        
+        self._recv_buffer = self._recv_buffer[msg_len:]
+        
         # Set selector to listen for write events, we're done reading.
         self._set_selector_events_mask("w")
 
     def create_response(self):
-        if self.jsonheader["content-type"] == "text/json":
-            response = self._create_response_json_content()
-        else:
-            # Binary or unknown content-type
-            response = self._create_response_binary_content()
+        response = ''
         message = self._create_message(**response)
         self.response_created = True
         self._send_buffer += message
